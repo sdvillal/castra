@@ -17,6 +17,18 @@ import pandas as pd
 from pandas import msgpack
 
 
+bp_args = bloscpack.BloscpackArgs(offsets=False, checksum='None')
+
+def blosc_args(dt):
+    if np.issubdtype(dt, int):
+        return bloscpack.BloscArgs(dt.itemsize, clevel=3, shuffle=True)
+    if np.issubdtype(dt, np.datetime64):
+        return bloscpack.BloscArgs(dt.itemsize, clevel=3, shuffle=True)
+    if np.issubdtype(dt, float):
+        return bloscpack.BloscArgs(dt.itemsize, clevel=1, shuffle=False)
+    return None
+
+
 def escape(text):
     return str(text)
 
@@ -138,7 +150,8 @@ class Castra(object):
         # Store index
         fn = self.dirname(partition_name, '.index')
         x = df.index.values
-        bloscpack.pack_ndarray_file(x, fn)
+        bloscpack.pack_ndarray_file(x, fn, bloscpack_args=bp_args,
+                blosc_args=blosc_args(x.dtype))
 
         if len(self.partitions) == 0:
             self.minimum = index.min()
@@ -240,7 +253,8 @@ def pack_file(x, fn):
         unpack_file
     """
     if x.dtype != 'O':
-        bloscpack.pack_ndarray_file(x, fn)
+        bloscpack.pack_ndarray_file(x, fn, bloscpack_args=bp_args,
+                blosc_args=blosc_args(x.dtype))
     else:
         bytes = blosc.compress(msgpack.packb(x.tolist()), 1)
         with open(fn, 'wb') as f:
