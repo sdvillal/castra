@@ -1,50 +1,70 @@
 from collections import Iterator
+
 import os
-from os import mkdir
-from os.path import exists, isdir, join
+
+from os.path import exists, isdir
+
 try:
     import cPickle as pickle
 except ImportError:
     import pickle
+
 import shutil
 import tempfile
+
 from functools import partial
 
 import blosc
 import bloscpack
+
 import numpy as np
 import pandas as pd
+
 from pandas import msgpack
+
+
+bp_args = bloscpack.BloscpackArgs(offsets=False, checksum='None')
+
+def blosc_args(dt):
+    if np.issubdtype(dt, int):
+        return bloscpack.BloscArgs(dt.itemsize, clevel=3, shuffle=True)
+    if np.issubdtype(dt, np.datetime64):
+        return bloscpack.BloscArgs(dt.itemsize, clevel=3, shuffle=True)
+    if np.issubdtype(dt, float):
+        return bloscpack.BloscArgs(dt.itemsize, clevel=1, shuffle=False)
+    return None
 
 
 def escape(text):
     return str(text)
 
 
-def _safe_mkdir(path):
+def mkdir(path):
     if not exists(path):
-        mkdir(path)
+        os.makedirs(path)
 
 
 class Castra(object):
+    meta_fields = ['columns', 'dtypes', 'index_dtype', 'axis_names']
+
     def __init__(self, path=None, template=None, categories=None):
         # check if we should create a random path
-        if path is None:
+        self._explicitly_given_path = path is not None
+
+        if not self._explicitly_given_path:
             self.path = tempfile.mkdtemp(prefix='castra-')
-            self._explicitly_given_path = False
         else:
             self.path = path
-            self._explicitly_given_path = True
 
         # check if the given path exists already and create it if it doesn't
-        if not exists(self.path):
-            mkdir(self.path)
+        mkdir(self.path)
+
         # raise an Exception if it isn't a directory
-        elif not isdir(self.path):
+        if not isdir(self.path):
             raise ValueError("'path': %s must be a directory")
 
         # either we have a meta directory
-        if exists(self.dirname('meta')) and isdir(self.dirname('meta')):
+        if isdir(self.dirname('meta')):
             if template is not None:
                 raise ValueError(
                     "'template' must be 'None' when opening a Castra")
@@ -54,10 +74,9 @@ class Castra(object):
 
         # or we don't, in which case we need a template
         elif template is not None:
-            mkdir(self.dirname('meta'))
-            mkdir(self.dirname('meta', 'categories'))
             self.columns, self.dtypes, self.index_dtype = \
                 list(template.columns), template.dtypes, template.index.dtype
+            self.axis_names = [template.index.name, template.columns.name]
             self.partitions = pd.Series([], dtype='O',
                                         index=template.index.__class__([]))
             self.minimum = None
@@ -70,6 +89,17 @@ class Castra(object):
             else:
                 self.categories = dict()
 
+            if self.categories:
+                categories = set(self.categories)
+                template_categories = set(template.dtypes.index.values)
+                if categories.difference(template_categories):
+                    raise ValueError('passed in categories %s are not all '
+                                     'contained in template dataframe columns '
+                                     '%s' % (categories, template_categories))
+                for c in self.categories:
+                    self.dtypes[c] = pd.core.categorical.CategoricalDtype()
+
+            mkdir(self.dirname('meta', 'categories'))
             self.flush_meta()
             self.save_partitions()
         else:
@@ -77,50 +107,59 @@ class Castra(object):
                 "must specify a 'template' when creating a new Castra")
 
     def load_meta(self, loads=pickle.loads):
-        meta = []
-        for name in ['columns', 'dtypes', 'index_dtype']:
-            with open(self.dirname('meta', name), 'r') as f:
-                meta.append(loads(f.read()))
-        self.columns, self.dtype, self.index_dtype = meta
+        for name in self.meta_fields:
+            with open(self.dirname('meta', name), 'rb') as f:
+                setattr(self, name, loads(f.read()))
 
     def flush_meta(self, dumps=partial(pickle.dumps, protocol=2)):
-        for name in ['columns', 'dtypes', 'index_dtype']:
-            with open(self.dirname('meta', name), 'w') as f:
+        for name in self.meta_fields:
+            with open(self.dirname('meta', name), 'wb') as f:
                 f.write(dumps(getattr(self, name)))
 
     def load_partitions(self, loads=pickle.loads):
-        with open(self.dirname('meta', 'plist'), 'r') as f:
-            self.partitions = pickle.load(f)
-        with open(self.dirname('meta', 'minimum'), 'r') as f:
-            self.minimum = pickle.load(f)
+        with open(self.dirname('meta', 'plist'), 'rb') as f:
+            self.partitions = loads(f.read())
+        with open(self.dirname('meta', 'minimum'), 'rb') as f:
+            self.minimum = loads(f.read())
 
     def save_partitions(self, dumps=partial(pickle.dumps, protocol=2)):
-        with open(self.dirname('meta', 'minimum'), 'w') as f:
+        with open(self.dirname('meta', 'minimum'), 'wb') as f:
             f.write(dumps(self.minimum))
-        with open(self.dirname('meta', 'plist'), 'w') as f:
+        with open(self.dirname('meta', 'plist'), 'wb') as f:
             f.write(dumps(self.partitions))
 
     def append_categories(self, new, dumps=partial(pickle.dumps, protocol=2)):
-        separator = '-sep-'
+        separator = b'-sep-'
         for col, cat in new.items():
             if cat:
-                with open(self.dirname('meta', 'categories', col), 'a') as f:
+                with open(self.dirname('meta', 'categories', col), 'ab') as f:
                     f.write(separator.join(map(dumps, cat)))
                     f.write(separator)
 
     def load_categories(self, loads=pickle.loads):
-        separator = '-sep-'
+        separator = b'-sep-'
         self.categories = dict()
         for col in self.columns:
             fn = self.dirname('meta', 'categories', col)
             if os.path.exists(fn):
-                with open(fn) as f:
+                with open(fn, 'rb') as f:
                     text = f.read()
-                L = text.split(separator)[:-1]
-                self.categories[col] = list(map(loads, L))
+                self.categories[col] = [loads(x)
+                                        for x in text.split(separator)[:-1]]
 
     def extend(self, df):
         # TODO: Ensure that df is consistent with existing data
+        if not df.index.is_monotonic_increasing:
+            df = df.sort_index(inplace=False)
+        if len(self.partitions) and df.index[0] < self.partitions.index[0]:
+            if is_trivial_index(df.index):
+                df = df.copy()
+                new_index = pd.Index(range(self.partitions.index[0] + 1,
+                                           self.partitions.index[0] + 1 + len(df)),
+                                    name = df.index.name)
+                df.index = new_index
+            else:
+                raise ValueError("Index of new dataframe less than known data")
         index = df.index.values
         partition_name = '--'.join([escape(index.min()), escape(index.max())])
 
@@ -131,17 +170,16 @@ class Castra(object):
 
         # Store columns
         for col in df.columns:
-            fn = self.dirname(partition_name, col)
-            x = df[col].values
-            pack_file(x, fn)
+            pack_file(df[col].values, self.dirname(partition_name, col))
 
         # Store index
         fn = self.dirname(partition_name, '.index')
         x = df.index.values
-        bloscpack.pack_ndarray_file(x, fn)
+        bloscpack.pack_ndarray_file(x, fn, bloscpack_args=bp_args,
+                blosc_args=blosc_args(x.dtype))
 
-        if len(self.partitions) == 0:
-            self.minimum = index.min()
+        if not len(self.partitions):
+            self.minimum = coerce_index(index.dtype, index.min())
         self.partitions[index.max()] = partition_name
         self.flush()
 
@@ -153,14 +191,14 @@ class Castra(object):
             columns = list(columns)
         if not isinstance(columns, list):
             df = self.load_partition(name, [columns], categorize=categorize)
-            return df[df.columns[0]]
-        arrays = [unpack_file(self.dirname(name, col))
-                   for col in columns]
+            return df.iloc[:, 0]
+        arrays = [unpack_file(self.dirname(name, col)) for col in columns]
         index = unpack_file(self.dirname(name, '.index'))
 
         df = pd.DataFrame(dict(zip(columns, arrays)),
-                            columns=columns,
-                            index=pd.Index(index, dtype=self.index_dtype))
+                          columns=pd.Index(columns, name=self.axis_names[1]),
+                          index=pd.Index(index, dtype=self.index_dtype,
+                                         name=self.axis_names[0]))
         if categorize:
             df = _categorize(self.categories, df)
         return df
@@ -229,7 +267,7 @@ class Castra(object):
             return dd.Series(dsk, name, columns, divisions)
 
 
-def pack_file(x, fn):
+def pack_file(x, fn, encoding='utf8'):
     """ Pack numpy array into filename
 
     Supports binary data with bloscpack and text data with msgpack+blosc
@@ -240,14 +278,15 @@ def pack_file(x, fn):
         unpack_file
     """
     if x.dtype != 'O':
-        bloscpack.pack_ndarray_file(x, fn)
+        bloscpack.pack_ndarray_file(x, fn, bloscpack_args=bp_args,
+                blosc_args=blosc_args(x.dtype))
     else:
-        bytes = blosc.compress(msgpack.packb(x.tolist()), 1)
+        bytes = blosc.compress(msgpack.packb(x.tolist(), encoding=encoding), 1)
         with open(fn, 'wb') as f:
             f.write(bytes)
 
 
-def unpack_file(fn):
+def unpack_file(fn, encoding='utf8'):
     """ Unpack numpy array from filename
 
     Supports binary data with bloscpack and text data with msgpack+blosc
@@ -262,8 +301,8 @@ def unpack_file(fn):
         return bloscpack.unpack_ndarray_file(fn)
     except ValueError:
         with open(fn, 'rb') as f:
-            bytes = f.read()
-        return np.array(msgpack.unpackb(blosc.decompress(bytes)))
+            return np.array(msgpack.unpackb(blosc.decompress(f.read()),
+                                            encoding=encoding))
 
 
 def coerce_index(dt, o):
@@ -279,16 +318,20 @@ def select_partitions(partitions, key):
     >>> select_partitions(p, slice(3, 25))
     ['b', 'c', 'd']
     """
-    assert key.step is None
+    assert key.step is None, 'step must be None but was %s' % key.step
     start, stop = key.start, key.stop
-    names = list(partitions.loc[start:stop])
+    if start is not None:
+        start = coerce_index(partitions.index.dtype, start)
+        istart = partitions.index.searchsorted(start)
+    else:
+        istart = 0
+    if stop is not None:
+        stop = coerce_index(partitions.index.dtype, stop)
+        istop = partitions.index.searchsorted(stop)
+    else:
+        istop = len(partitions) - 1
 
-    last = partitions.searchsorted(names[-1])[0]
-
-    stop2 = coerce_index(partitions.index.dtype, stop)
-    if partitions.index[last] < stop2 and len(partitions) > last + 1:
-        names.append(partitions.iloc[last + 1])
-
+    names = partitions.iloc[istart: istop + 1].values.tolist()
     return names
 
 
@@ -320,7 +363,9 @@ def _decategorize(categories, df):
     new_categories = dict()
     new_columns = dict((col, df[col]) for col in df.columns)
     for col, cat in categories.items():
-        extra[col] = list(set(df[col]) - set(cat))
+        idx = pd.Index(df[col])
+        idx = getattr(idx, 'categories', idx)
+        extra[col] = idx[~idx.isin(cat)].unique().tolist()
         new_categories[col] = cat + extra[col]
         new_columns[col] = pd.Categorical(df[col], new_categories[col]).codes
     new_df = pd.DataFrame(new_columns, columns=df.columns, index=df.index)
@@ -353,3 +398,17 @@ def _categorize(categories, df):
                     for col in df.columns),
                 columns=df.columns,
                 index=df.index)
+
+
+def is_trivial_index(ind):
+    """ Is this index just 0..n ?
+
+    If so then we can probably ignore or change it around as necessary
+
+    >>> is_trivial_index(pd.Index([0, 1, 2]))
+    True
+
+    >>> is_trivial_index(pd.Index([0, 3, 5]))
+    False
+    """
+    return ind[0] == 0 and (ind == range(len(ind))).all()

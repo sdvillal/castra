@@ -1,14 +1,19 @@
 import os
-import pandas as pd
-import pandas.util.testing as tm
-import numpy as np
-from castra import Castra
-from castra.core import _safe_mkdir
 import tempfile
 import pickle
 import shutil
-import nose.tools as nt
-import unittest
+
+import pandas as pd
+import pandas.util.testing as tm
+
+import pytest
+
+import numpy as np
+
+import pytest
+
+from castra import Castra
+from castra.core import mkdir, select_partitions
 
 
 A = pd.DataFrame({'x': [1, 2],
@@ -22,84 +27,100 @@ B = pd.DataFrame({'x': [10, 20],
                  index=[10, 20])
 
 
-class Base(unittest.TestCase):
-
-    def setUp(self):
-        self.path = tempfile.mkdtemp(prefix='castra-')
-
-    def tearDown(self):
-        shutil.rmtree(self.path)
+C = pd.DataFrame({'x': [10, 20],
+                  'y': [10., 20.],
+                  'z': [0, 1]},
+                 columns=['x', 'y', 'z']).set_index('z')
+C.columns.name = 'cols'
 
 
-class TestSafeMkdir(Base):
-
-    def test_safe_mkdir_with_new(self):
-        path = os.path.join(self.path, 'db')
-        _safe_mkdir(path)
-        nt.assert_true(os.path.exists(path))
-        nt.assert_true(os.path.isdir(path))
-
-    def test_safe_mkdir_with_existing(self):
-        # an existing path should not raise an exception
-        _safe_mkdir(self.path)
+@pytest.yield_fixture
+def base():
+    d = tempfile.mkdtemp(prefix='castra-')
+    try:
+        yield d
+    finally:
+        shutil.rmtree(d)
 
 
-class TestConstructorAndContextManager(Base):
+def test_safe_mkdir_with_new(base):
+    path = os.path.join(base, 'db')
+    mkdir(path)
+    assert os.path.exists(path)
+    assert os.path.isdir(path)
 
-    def test_create_with_random_directory(self):
-        Castra(template=A)
 
-    def test_create_with_non_existing_path(self):
-        path = os.path.join(self.path, 'db')
-        Castra(path=path, template=A)
+def test_safe_mkdir_with_existing(base):
+    # an existing path should not raise an exception
+    mkdir(base)
 
-    def test_create_with_existing_path(self):
-        Castra(path=self.path, template=A)
 
-    def test_exception_with_non_dir(self):
-        file_ = os.path.join(self.path, 'file')
-        with open(file_, 'w') as f:
-            f.write('file')
-        nt.assert_raises(ValueError, Castra, path=file_)
+def test_create_with_random_directory():
+    Castra(template=A)
 
-    def test_exception_with_existing_castra_and_template(self):
-        with Castra(path=self.path, template=A) as c:
-            c.extend(A)
-        nt.assert_raises(ValueError, Castra, path=self.path, template=A)
 
-    def test_exception_with_empty_dir_and_no_template(self):
-        nt.assert_raises(ValueError, Castra, path=self.path)
+def test_create_with_non_existing_path(base):
+    path = os.path.join(base, 'db')
+    Castra(path=path, template=A)
 
-    def test_load(self):
-        with Castra(path=self.path, template=A) as c:
-            c.extend(A)
-            c.extend(B)
 
-        loaded = Castra(path=self.path)
-        tm.assert_frame_equal(pd.concat([A, B]), loaded[:])
+def test_create_with_existing_path(base):
+    Castra(path=base, template=A)
 
-    def test_del_with_random_dir(self):
-        c = Castra(template=A)
+
+def test_exception_with_non_dir(base):
+    file_ = os.path.join(base, 'file')
+    with open(file_, 'w') as f:
+        f.write('file')
+    with pytest.raises(ValueError):
+        Castra(file_)
+
+
+def test_exception_with_existing_castra_and_template(base):
+    with Castra(path=base, template=A) as c:
+        c.extend(A)
+    with pytest.raises(ValueError):
+        Castra(path=base, template=A)
+
+
+def test_exception_with_empty_dir_and_no_template(base):
+    with pytest.raises(ValueError):
+        Castra(path=base)
+
+
+def test_load(base):
+    with Castra(path=base, template=A) as c:
+        c.extend(A)
+        c.extend(B)
+
+    loaded = Castra(path=base)
+    tm.assert_frame_equal(pd.concat([A, B]), loaded[:])
+
+
+def test_del_with_random_dir():
+    c = Castra(template=A)
+    assert os.path.exists(c.path)
+    c.__del__()
+    assert not os.path.exists(c.path)
+
+
+def test_context_manager_with_random_dir():
+    with Castra(template=A) as c:
         assert os.path.exists(c.path)
-        c.__del__()
-        assert not os.path.exists(c.path)
+    assert not os.path.exists(c.path)
 
-    def test_context_manager_with_random_dir(self):
-        with Castra(template=A) as c:
-            assert os.path.exists(c.path)
-        assert not os.path.exists(c.path)
 
-    def test_context_manager_with_specific_dir(self):
-        with Castra(path=self.path, template=A) as c:
-            assert os.path.exists(c.path)
+def test_context_manager_with_specific_dir(base):
+    with Castra(path=base, template=A) as c:
         assert os.path.exists(c.path)
+    assert os.path.exists(c.path)
 
 
 def test_timeseries():
     indices = [pd.DatetimeIndex(start=str(i), end=str(i+1), freq='w')
-                for i in range(2000, 2015)]
+               for i in range(2000, 2015)]
     dfs = [pd.DataFrame({'x': list(range(len(ind)))}, ind)
-                for ind in indices]
+           for ind in indices]
 
     with Castra(template=dfs[0]) as c:
         for df in dfs:
@@ -218,3 +239,91 @@ def test_categorize():
 
         d = Castra(path=c.path)
         tm.assert_frame_equal(c[:], d[:])
+
+
+def test_save_axis_names():
+    with Castra(template=C) as c:
+        c.extend(C)
+        assert c[:].index.name == 'z'
+        assert c[:].columns.name == 'cols'
+        tm.assert_frame_equal(c[:], C)
+
+
+def test_same_categories_when_already_categorized():
+    A = pd.DataFrame({'x': [1, 2] * 1000,
+                      'y': [1., 2.] * 1000,
+                      'z': np.random.choice(list('abc'), size=2000)},
+                     columns=list('xyz'))
+    A['z'] = A.z.astype('category')
+    with Castra(template=A, categories=['z']) as c:
+        c.extend(A)
+        assert c.categories['z'] == A.z.cat.categories.tolist()
+
+
+def test_category_dtype():
+    A = pd.DataFrame({'x': [1, 2] * 3,
+                      'y': [1., 2.] * 3,
+                      'z': list('abcabc')},
+                     columns=list('xyz'))
+    with Castra(template=A, categories=['z']) as c:
+        c.extend(A)
+        assert A.dtypes['z'] == 'object'
+        assert c.dtypes['z'] == pd.core.categorical.CategoricalDtype()
+
+
+def test_do_not_create_dirs_if_template_fails():
+    A = pd.DataFrame({'x': [1, 2] * 3,
+                      'y': [1., 2.] * 3,
+                      'z': list('abcabc')},
+                     columns=list('xyz'))
+    with pytest.raises(ValueError):
+        Castra(template=A, path='foo', categories=['w'])
+    assert not os.path.exists(os.path.join('foo', 'meta'))
+    assert not os.path.exists(os.path.join('foo', 'meta', 'categories'))
+
+
+def test_sort_on_extend():
+    df = pd.DataFrame({'x': [1, 2, 3]}, index=[3, 2, 1])
+    expected = pd.DataFrame({'x': [3, 2, 1]}, index=[1, 2, 3])
+    with Castra(template=df) as c:
+        c.extend(df)
+        tm.assert_frame_equal(c[:], expected)
+
+
+def test_select_partitions():
+    p = pd.Series(['a', 'b', 'c', 'd', 'e'], index=[0, 10, 20, 30, 40])
+    assert select_partitions(p, slice(3, 25)) == ['b', 'c', 'd']
+    assert select_partitions(p, slice(None, 25)) == ['a', 'b', 'c', 'd']
+    assert select_partitions(p, slice(3, None)) == ['b', 'c', 'd', 'e']
+    assert select_partitions(p, slice(None, None)) == ['a', 'b', 'c', 'd', 'e']
+    assert select_partitions(p, slice(10, 30)) == ['b', 'c', 'd']
+
+
+def test_minimum_dtype():
+    df = tm.makeTimeDataFrame()
+
+    with Castra(template=df) as c:
+        c.extend(df)
+        assert type(c.minimum) == type(c.partitions.index[0])
+
+
+def test_many_default_indexes():
+    a = pd.DataFrame({'x': [1, 2, 3]})
+    b = pd.DataFrame({'x': [4, 5, 6]})
+
+    with Castra(template=a) as c:
+        c.extend(a)
+        c.extend(b)
+
+        assert (c[:, 'x'].values == [1, 2, 3, 4, 5, 6]).all()
+
+
+def test_raise_error_on_mismatched_index():
+    a = pd.DataFrame({'x': [1, 2, 3]}, index=[1, 2, 3])
+    b = pd.DataFrame({'x': [4, 5, 6]}, index=[2, 3, 4])
+
+    with Castra(template=a) as c:
+        c.extend(a)
+
+        with pytest.raises(ValueError):
+            c.extend(b)
