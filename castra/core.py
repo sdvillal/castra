@@ -50,6 +50,7 @@ class Castra(object):
     def __init__(self, path=None, template=None, categories=None):
         # check if we should create a random path
         self._explicitly_given_path = path is not None
+        self.minimum = None
 
         if not self._explicitly_given_path:
             self.path = tempfile.mkdtemp(prefix='castra-')
